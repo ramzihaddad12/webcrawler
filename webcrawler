@@ -1,0 +1,296 @@
+#!/usr/bin/env python3
+
+import argparse
+from telnetlib import SE
+from parsers import FriendParser, SecretFlagParser, PageNumberParser
+import socket
+import ssl
+import sys
+
+PORT_NUMBER = 443
+MAX_BYTES = 16384
+ENCODING_TYPE = 'utf-8'
+SERVER_NAME = "project2.5700.network"
+LOG_IN_EXTENSION = "/accounts/login/?next=/fakebook"
+CONNECTION_CLOSE_MESSAGE = "Connection: close"
+LOG_IN_PAGE = SERVER_NAME + LOG_IN_EXTENSION
+ERROR_MESSAGE = "ERROR"
+SEPERATOR = "\r\n"
+ENDING = "\r\n\r\n"
+GET = "GET "
+POST = "POST "
+HTTP_VERSION = " HTTP/1.1\r\n"
+GET_LOG_IN_PAGE = GET + LOG_IN_EXTENSION + HTTP_VERSION + "Host:" + SERVER_NAME + ENDING
+POST_LOG_IN_PAGE = POST + LOG_IN_EXTENSION + HTTP_VERSION + "Host:" + SERVER_NAME 
+HAULTING_STATUSES = ["301", "302", "403", "404", "500", "503"]
+
+# function to write the 5 secret flags to file
+def write_secret_flags(flags):
+    SECRET_FLAG_FILE= open("secret_flags", "w")
+    for SECRET_FLAG in flags:
+        SECRET_FLAG_FILE.write(SECRET_FLAG + "\n")
+    SECRET_FLAG_FILE.close()
+
+# function to receive the entire message from the server 
+def recv_all(s):
+    entire_message = ""
+    while True:
+        recieved = s.recv(MAX_BYTES)
+        recieved = recieved.decode(ENCODING_TYPE)
+
+        entire_message += recieved
+        # the entire message is received when there is an ending html tag or there is nothing read 
+        if '</html>' in recieved or '</html>' in entire_message or len(recieved) == 0:
+            break
+
+        # check for a haulting status in the response (301, 302) which do not have a body 
+        found_haulting_status = False
+        for haulting_status in HAULTING_STATUSES:
+            if ENDING in entire_message and (("HTTP/1.1" + haulting_status) in recieved or ("HTTP/1.1" + haulting_status) in entire_message): 
+                found_haulting_status = True
+                break
+
+        if found_haulting_status:
+            break
+    return entire_message
+
+# function to receive the entire message from the server 
+def recv_all_from_post(s):
+    entire_message = ""
+    while True:
+        recieved = s.recv(MAX_BYTES)
+        recieved = recieved.decode(ENCODING_TYPE)
+        entire_message += recieved
+        # The entire message is received when there is a new line character 
+        if '\r\n\r\n' in recieved or '\r\n\r\n' in entire_message:
+            break
+    return entire_message
+
+# function that gets the csrf token for the site
+def get_csrf_token(response):
+    index = response.index("csrftoken=")
+    index += len("csrftoken=")
+
+    curr_char = response[index]
+    csrf_token = ""
+    while curr_char != ';':
+        csrf_token += curr_char
+        index += 1
+        curr_char = response[index]
+    return csrf_token
+
+# function that gets the session id for the site
+def get_session_id(response):
+    index = response.index("sessionid=")
+    index += len("sessionid=")
+
+    curr_char = response[index]
+    session_id = ""
+    while curr_char != ';':
+        session_id += curr_char
+        index += 1
+        curr_char = response[index]
+    return session_id
+
+# function that gets the redirected location for the site
+def get_redirected_location(response):
+    index = response.index("Location: ")
+    index += len("Location: ")
+
+    curr_char = response[index]
+    
+    redirected_location = ""
+    while curr_char != '\r':
+        redirected_location += curr_char
+        index += 1
+        curr_char = response[index]
+    return redirected_location
+
+# function that handles logging in via the username and password 
+def handle_login(socket, USERNAME, PASSWORD):
+
+    # go to the main page via HTTP GET in order to get the needed csrf token and session id 
+    socket.sendall(GET_LOG_IN_PAGE.encode(ENCODING_TYPE))
+    response = recv_all(socket)
+    csrf_token = get_csrf_token(response)
+    session_id = get_session_id(response)
+
+    # once the tokens are set, log in via the username and password, along with sending the csrf token 
+    LOG_IN_POST_BODY = "username=" + USERNAME + "&" + "password=" + PASSWORD +  "&" + "csrfmiddlewaretoken=" + csrf_token + "&" + "next="
+    POST_MESSAGE = POST_LOG_IN_PAGE + SEPERATOR + "Cookie: sessionid=" + session_id + ";csrftoken=" + csrf_token + SEPERATOR + "Content-Type: application/x-www-form-urlencoded" + SEPERATOR +  "Content-Length:" + str(len(LOG_IN_POST_BODY)) + ENDING + LOG_IN_POST_BODY
+    socket.sendall(POST_MESSAGE.encode(ENCODING_TYPE))
+    response = recv_all_from_post(socket)
+    csrf_token = get_csrf_token(response)
+    session_id = get_session_id(response)
+    
+    # after logging in, go to the /fakebook/ main page for the logged in user
+    response, socket, session_id, csrf_token = handle_get_request(socket, "/fakebook/", session_id, csrf_token)
+
+    return response, socket, session_id, csrf_token
+
+# function that handle a get request for a specific url
+def handle_get_request(socket, url, session_id, csrf_token):
+    # via HTTP GET, go to the desired URL 
+    PAGE = GET + url + HTTP_VERSION + "Host:" + SERVER_NAME + SEPERATOR + "Cookie: sessionid=" + session_id + ";" + "csrftoken=" + csrf_token + ENDING
+    socket.sendall(PAGE.encode(ENCODING_TYPE))
+    response = recv_all(socket)
+    # check for new/changed cookies in the response 
+    session_id, csrf_token = check_for_new_cookies(response, session_id, csrf_token)
+
+    # if the server closes the connection, the connection should be re-estabilished 
+    if CONNECTION_CLOSE_MESSAGE in response:
+        socket.close()
+        socket = connect_to_server()
+
+    # get the status code of the response and check if the request was successful
+    x = response.index("HTTP/1.1 ") + len("HTTP/1.1 ")
+    status_code = int(response[x: x + 3])
+
+    # when 301 or 302 status code occurs, try the request again using the new URL given by the server.
+    if status_code == 301 or status_code == 302:
+        redirected_location = get_redirected_location(response)
+        return handle_get_request(socket, redirected_location, session_id, csrf_token)
+
+    # when a 403 - Forbidden and 404 - Not Found error occurs, abandon the URL that generated the error code.
+    elif status_code == 403 or status_code == 404:
+        print(ERROR_MESSAGE)
+        return ERROR_MESSAGE, socket, session_id, csrf_token
+    
+    # when internal server error - 500 or 503 is thrown, retry the request for the URL until the request is successful
+    elif status_code == 500 or status_code == 503:
+        return handle_get_request(socket, url, session_id, csrf_token)
+
+    return response, socket, session_id, csrf_token
+
+# function that checks if the cookies have changed and returns the new ones
+def check_for_new_cookies(response, session_id, csrf_token):
+    # If there's set-cookie message in response --> new cookies available that need to parsed/found
+    if "Set-Cookie" or "set-cookie" in response:
+        if "csrftoken" in response:
+            csrf_token = get_csrf_token(response)
+
+        if "sessionid" in response:
+            session_id = get_session_id(response)
+
+    return session_id, csrf_token
+
+    
+# function that performs the socket connection with the server s
+def connect_to_server():
+    # Instantiating client socket and connecting to server 
+    unwrappedSocket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    s = ssl.wrap_socket(unwrappedSocket, ssl_version=ssl.PROTOCOL_TLSv1_2)
+    s.connect((SERVER_NAME, PORT_NUMBER))
+    return s
+
+# main program starts here! 
+if __name__ == '__main__':
+    # parsing the inputs from the command line
+    args_parser = argparse.ArgumentParser(description='CS5700 Project 2')
+    args_parser.add_argument("-s", default=SERVER_NAME, type=str,  help="Indicates that the client should use an encrypted socket connection")
+    args_parser.add_argument("-p", default=PORT_NUMBER, type=int, help="Port Number of Server")
+    args_parser.add_argument("username", help="Fakebook Username")
+    args_parser.add_argument("password",  help="Fakebook Password")
+
+    args = sys.argv[1:]
+
+    if args[0] == "-s":
+        SERVER_NAME = args[1]
+
+        if args[2] == "-p":
+            PORT_NUMBER = int(args[3])
+            USERNAME = args[4]
+            PASSWORD = args[5]
+        else:
+            USERNAME = args[2]
+            PASSWORD = args[3]
+
+    
+    elif args[0] == "-p":
+        PORT_NUMBER = int(args[1])
+        USERNAME = args[2]
+        PASSWORD = args[3]
+    else:
+        USERNAME = args[0]
+        PASSWORD = args[1]
+
+    
+    # instantiate parser to look for secret flags 
+    secret_flag_parser = SecretFlagParser()
+
+    # connect to the server 
+    s = connect_to_server()
+
+    # log in to fakebook
+    r, s, session_id, csrf_token = handle_login(s, USERNAME, PASSWORD)
+
+    # parse the /fakebook page to check for secret flag
+    secret_flag_parser.feed(r)
+
+    # parse the /fakebook page to get the profile links of random users on fakebook
+    initial_random_users_parser = FriendParser()
+    initial_random_users_parser.feed(r)
+    initial_random_users = initial_random_users_parser.friends_links
+
+    # instantiate a queue and a visited set needed for crawling using BFS 
+    queue = []
+    visited = set()
+
+    # put the random friends in the initial queue
+    start_index = 0 
+    while start_index < len(initial_random_users):
+        queue.append(initial_random_users[start_index])
+        start_index += 1
+
+    # crawl using BFS. The crawling will stop once all 5 secret flags are found or there are no more pages to crawl (when queue is empty)
+    while len(queue) > 0 and len(secret_flag_parser.secret_flags) < 5:
+        curr = queue.pop(0)
+        
+        # if the page has visited before, then no need to crawl page
+        if curr in visited: 
+            continue
+
+        else: 
+            # add the current page to the visited set 
+            visited.add(curr)
+
+            # visit the profile page for the current user 
+            r, s, session_id, csrf_token = handle_get_request(s, curr, session_id, csrf_token)
+            if r == ERROR_MESSAGE: continue
+            
+            # parse the current page to check for secret flag
+            secret_flag_parser.feed(r)
+
+            # visit the /friends/1 page 
+            r, s, session_id, csrf_token = handle_get_request(s, curr + "friends/" + "1/", session_id, csrf_token)
+            if r == ERROR_MESSAGE: continue
+
+            # parse the /friends/1/  page to get the total number of pages of friends that the current user has 
+            page_number_parser = PageNumberParser()
+            page_number_parser.feed(r)
+            num_of_pages = int(page_number_parser.num_of_pages)
+
+            # looping to get links to all the profiles of the current user's friends
+            for page_num in range(1, num_of_pages + 1):
+
+                # visit the friends/page_num page to get the list of friends for the current user 
+                r, s, session_id, csrf_token = handle_get_request(s, curr + "friends/" + str(page_num) + "/", session_id, csrf_token)
+                if r == ERROR_MESSAGE: continue
+
+                # parse the /friends/page_num page to check for secret flag
+                secret_flag_parser.feed(r)
+
+                # parse the /friends/page_num page to get the profile links of the current fakebook user's friends
+                friend_parser = FriendParser()
+                friend_parser.feed(r)
+                friends = friend_parser.friends_links
+
+                # add the friends' pages to the queue so that these pages can be crawled 
+                for friend in friends:
+                    queue.append(friend)
+
+    # close connection 
+    s.close()
+
+    # write secret flags to file
+    write_secret_flags(secret_flag_parser.secret_flags)
